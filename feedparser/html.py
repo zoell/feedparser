@@ -114,27 +114,169 @@ class _BaseHTMLProcessor(sgmllib.SGMLParser, object):
     # feedparser's scope instead of sgmllib's. This means that the
     # `tagfind` and `charref` regular expressions will be found as
     # they're declared above, not as they're declared in sgmllib.
-    def goahead(self, i):
-        raise NotImplementedError
+    def goahead(self, end):
+        rawdata = self.rawdata
+        i = 0
+        n = len(rawdata)
+        while i < n:
+            if self.nomoretags:
+                self.handle_data(rawdata[i:n])
+                i = n
+                break
+            match = interesting.search(rawdata, i)
+            if match: j = match.start()
+            else: j = n
+            if i < j:
+                self.handle_data(rawdata[i:j])
+            i = j
+            if i == n: break
+            if rawdata[i] == '<':
+                if starttagopen.match(rawdata, i):
+                    if self.literal:
+                        self.handle_data(rawdata[i])
+                        i = i+1
+                        continue
+                    k = self.parse_starttag(i)
+                    if k < 0: break
+                    i = k
+                    continue
+                if rawdata.startswith("</", i):
+                    k = self.parse_endtag(i)
+                    if k < 0: break
+                    i = k
+                    self.literal = 0
+                    continue
+                if self.literal:
+                    if n > (i + 1):
+                        self.handle_data("<")
+                        i = i+1
+                    else:
+                        # incomplete
+                        break
+                    continue
+                if rawdata.startswith("<!--", i):
+                        # Strictly speaking, a comment is --.*--
+                        # within a declaration tag <!...>.
+                        # This should be removed,
+                        # and comments handled only in parse_declaration.
+                    k = self.parse_comment(i)
+                    if k < 0: break
+                    i = k
+                    continue
+                if rawdata.startswith("<?", i):
+                    k = self.parse_pi(i)
+                    if k < 0: break
+                    i = i+k
+                    continue
+                if rawdata.startswith("<!", i):
+                    # This is some sort of declaration; in "HTML as
+                    # deployed," this should only be the document type
+                    # declaration ("<!DOCTYPE html...>").
+                    k = self.parse_declaration(i)
+                    if k < 0: break
+                    i = k
+                    continue
+            elif rawdata[i] == '&':
+                if self.literal:
+                    self.handle_data(rawdata[i])
+                    i = i+1
+                    continue
+                match = charref.match(rawdata, i)
+                if match:
+                    name = match.group(1)
+                    self.handle_charref(name)
+                    i = match.end(0)
+                    if rawdata[i-1] != ';': i = i-1
+                    continue
+                match = entityref.match(rawdata, i)
+                if match:
+                    name = match.group(1)
+                    self.handle_entityref(name)
+                    i = match.end(0)
+                    if rawdata[i-1] != ';': i = i-1
+                    continue
+            else:
+                self.error('neither < nor & ??')
+            # We get here only if incomplete matches but
+            # nothing else
+            match = incomplete.match(rawdata, i)
+            if not match:
+                self.handle_data(rawdata[i])
+                i = i+1
+                continue
+            j = match.end(0)
+            if j == n:
+                break # Really incomplete
+            self.handle_data(rawdata[i:j])
+            i = j
+        # end while
+        if end and i < n:
+            self.handle_data(rawdata[i:n])
+            i = n
+        self.rawdata = rawdata[i:]
+        # XXX if end: check for empty stack
 
-    # Replace goahead with SGMLParser's goahead() code object.
-    try:
-        goahead.__code__ = sgmllib.SGMLParser.goahead.__code__
-    except AttributeError:
-        # Python 2
-        # noinspection PyUnresolvedReferences
-        goahead.func_code = sgmllib.SGMLParser.goahead.func_code
 
     def __parse_starttag(self, i):
-        raise NotImplementedError
-
-    # Replace __parse_starttag with SGMLParser's parse_starttag() code object.
-    try:
-        __parse_starttag.__code__ = sgmllib.SGMLParser.parse_starttag.__code__
-    except AttributeError:
-        # Python 2
-        # noinspection PyUnresolvedReferences
-        __parse_starttag.func_code = sgmllib.SGMLParser.parse_starttag.func_code
+        self.__starttag_text = None
+        start_pos = i
+        rawdata = self.rawdata
+        if shorttagopen.match(rawdata, i):
+            # SGML shorthand: <tag/data/ == <tag>data</tag>
+            # XXX Can data contain &... (entity or char refs)?
+            # XXX Can data contain < or > (tag characters)?
+            # XXX Can there be whitespace before the first /?
+            match = shorttag.match(rawdata, i)
+            if not match:
+                return -1
+            tag, data = match.group(1, 2)
+            self.__starttag_text = '<%s/' % tag
+            tag = tag.lower()
+            k = match.end(0)
+            self.finish_shorttag(tag, data)
+            self.__starttag_text = rawdata[start_pos:match.end(1) + 1]
+            return k
+        # XXX The following should skip matching quotes (' or ")
+        # As a shortcut way to exit, this isn't so bad, but shouldn't
+        # be used to locate the actual end of the start tag since the
+        # < or > characters may be embedded in an attribute value.
+        match = endbracket.search(rawdata, i+1)
+        if not match:
+            return -1
+        j = match.start(0)
+        # Now parse the data between i+1 and j into a tag and attrs
+        attrs = []
+        if rawdata[i:i+2] == '<>':
+            # SGML shorthand: <> == <last open tag seen>
+            k = j
+            tag = self.lasttag
+        else:
+            match = tagfind.match(rawdata, i+1)
+            if not match:
+                self.error('unexpected call to parse_starttag')
+            k = match.end(0)
+            tag = rawdata[i+1:k].lower()
+            self.lasttag = tag
+        while k < j:
+            match = attrfind.match(rawdata, k)
+            if not match: break
+            attrname, rest, attrvalue = match.group(1, 2, 3)
+            if not rest:
+                attrvalue = attrname
+            else:
+                if (attrvalue[:1] == "'" == attrvalue[-1:] or
+                    attrvalue[:1] == '"' == attrvalue[-1:]):
+                    # strip quotes
+                    attrvalue = attrvalue[1:-1]
+                attrvalue = self.entity_or_charref.sub(
+                    self._convert_ref, attrvalue)
+            attrs.append((attrname.lower(), attrvalue))
+            k = match.end(0)
+        if rawdata[j] == '>':
+            j = j+1
+        self.__starttag_text = rawdata[start_pos:j]
+        self.finish_starttag(tag, attrs)
+        return j
 
     def parse_starttag(self, i):
         j = self.__parse_starttag(i)
